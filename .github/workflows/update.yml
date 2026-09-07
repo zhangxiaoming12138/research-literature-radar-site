@@ -1,0 +1,64 @@
+name: Update literature radar website
+
+on:
+  schedule:
+    # 08:20 Asia/Shanghai = 00:20 UTC
+    - cron: "20 0 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Publication lookback window in days"
+        required: false
+        default: "3"
+      max_pages:
+        description: "Maximum OpenAlex pages per query (100 works/page)"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: literature-radar-site-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update cumulative public index
+        run: |
+          DAYS="${{ github.event.inputs.days || '3' }}"
+          PAGES="${{ github.event.inputs.max_pages || '3' }}"
+          python update_site.py --days "$DAYS" --max-pages "$PAGES"
+
+      - name: Privacy guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Eiq 'C:\\Users\\|/Users/|\.pi[/\\]agent|chatgpt_personal_backup|BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' papers.json index.html; then
+            echo "Potential private/local content detected; refusing to publish."
+            exit 1
+          fi
+
+      - name: Commit updated website data
+        run: |
+          git config user.name "literature-radar[bot]"
+          git config user.email "literature-radar[bot]@users.noreply.github.com"
+          git add papers.json
+          if git diff --cached --quiet; then
+            echo "No website data changes"
+            exit 0
+          fi
+          git commit -m "site: daily literature update $(date -u +%F)"
+          git pull --rebase
+          git push
