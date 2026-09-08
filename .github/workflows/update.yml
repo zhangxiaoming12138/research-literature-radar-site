@@ -1,64 +1,71 @@
-name: Update literature radar website
+name: Validate literature radar website
 
 on:
   schedule:
-    # 08:20 Asia/Shanghai = 00:20 UTC
+    # 08:20 Asia/Shanghai = 00:20 UTC. This job validates freshness/integrity;
+    # it does not run an independent OpenAlex-only data pipeline.
     - cron: "20 0 * * *"
   workflow_dispatch:
-    inputs:
-      days:
-        description: "Publication lookback window in days"
-        required: false
-        default: "3"
-      max_pages:
-        description: "Maximum OpenAlex pages per query (100 works/page)"
-        required: false
-        default: "3"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: literature-radar-site-update
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  update:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Update cumulative public index
+      - name: Validate scored public index
         run: |
-          DAYS="${{ github.event.inputs.days || '3' }}"
-          PAGES="${{ github.event.inputs.max_pages || '3' }}"
-          python update_site.py --days "$DAYS" --max-pages "$PAGES"
+          python - <<'PY'
+          import json
+          import re
+          from collections import Counter
+          from pathlib import Path
 
-      - name: Privacy guard
+          path = Path("papers.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          items = data.get("items") or []
+          assert int(data.get("schema_version") or 0) >= 2, "schema_version must be >= 2"
+          assert int(data.get("total") or -1) == len(items), "total/item count mismatch"
+          assert int(data.get("strong_total") or 0) == sum(bool(x.get("is_strong")) for x in items), "strong_total mismatch"
+          assert data.get("pipeline"), "pipeline health metadata is missing"
+
+          required = {
+              "key", "title", "title_zh", "score", "classification", "eligible",
+              "matched_keywords", "relevance_reason", "is_strong", "jcr_quartile",
+              "cas_zone", "ranking_year", "ranking_source", "first_seen", "last_seen",
+          }
+          for index, item in enumerate(items):
+              missing = required - set(item)
+              assert not missing, f"item {index} missing fields: {sorted(missing)}"
+
+          dois = [str(x.get("doi") or "").strip().lower() for x in items if x.get("doi")]
+          titles = [
+              key
+              for x in items
+              if (key := re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(x.get("title") or "").casefold(), flags=re.UNICODE).strip())
+          ]
+          duplicate_dois = [key for key, count in Counter(dois).items() if key and count > 1]
+          duplicate_titles = [key for key, count in Counter(titles).items() if key and count > 1]
+          assert not duplicate_dois, f"duplicate DOI count: {len(duplicate_dois)}"
+          assert not duplicate_titles, f"duplicate normalized-title count: {len(duplicate_titles)}"
+          print(f"validated {len(items)} unique papers; strong={data.get('strong_total')}; pipeline={data['pipeline'].get('status')}")
+          PY
+
+      - name: Validate UTF-8 website and privacy boundary
         shell: bash
         run: |
           set -euo pipefail
-          if grep -Eiq 'C:\\Users\\|/Users/|\.pi[/\\]agent|chatgpt_personal_backup|BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' papers.json index.html; then
-            echo "Potential private/local content detected; refusing to publish."
+          grep -Fq '关键词文献雷达' index.html
+          grep -Fq 'data-default-view="strong"' strong.html
+          if grep -Eiq 'C:\\Users\\|/Users/|\.pi[/\\]agent|chatgpt_personal_backup|BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' papers.json index.html strong.html; then
+            echo "Potential private/local content detected."
             exit 1
           fi
-
-      - name: Commit updated website data
-        run: |
-          git config user.name "literature-radar[bot]"
-          git config user.email "literature-radar[bot]@users.noreply.github.com"
-          git add papers.json
-          if git diff --cached --quiet; then
-            echo "No website data changes"
-            exit 0
-          fi
-          git commit -m "site: daily literature update $(date -u +%F)"
-          git pull --rebase
-          git push
